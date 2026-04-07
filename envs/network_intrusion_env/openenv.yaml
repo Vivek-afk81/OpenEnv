@@ -1,0 +1,16 @@
+name: network-intrusion-env
+version: 0.1.0
+description: >
+  A network intrusion detection RL environment where an agent analyzes
+  network traffic logs, classifies threats (DDoS, port scan, brute force,
+  or normal), and recommends appropriate response actions. Rewards are
+  based on accuracy of both classification and response.
+author: HeyltsMeStone
+tags:
+  - cybersecurity
+  - network
+  - classification
+  - real-world
+entry_point: server.app:app
+hf_space:
+  port: 8000
