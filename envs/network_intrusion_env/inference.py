@@ -1,6 +1,6 @@
 """
 Inference script for Network Intrusion Detection Environment.
-Multi-step: agent investigates clues before classifying the threat.
+Multi-step: agent investigates before classifying.
 """
 
 import json
@@ -16,252 +16,116 @@ openai_client = OpenAI(
     api_key=HF_TOKEN,
 )
 
-VALID_THREATS = ["ddos", "port_scan", "brute_force", "normal"]
-VALID_RESPONSES = ["block_ip", "rate_limit", "alert_only", "ignore"]
 
-# Ground-truth mapping the agent must learn from evidence alone
-THREAT_RESPONSE_MAP = {
-    "ddos": "block_ip",
-    "port_scan": "alert_only",
-    "brute_force": "block_ip",
-    "normal": "ignore",
-}
-
-
-def call_llm(prompt: str, max_tokens: int = 200) -> str:
-    """Single LLM call. Returns raw text response."""
+def call_llm(prompt: str) -> str:
     response = openai_client.chat.completions.create(
         model="Qwen/Qwen2.5-7B-Instruct",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
-        temperature=0.1,
+        max_tokens=200,
+        temperature=0.1
     )
     return response.choices[0].message.content
 
 
-def parse_json_answer(raw: str) -> dict | None:
-    """
-    Robustly extract JSON from LLM output.
-    Handles markdown fences, extra text, etc.
-    Returns None if parsing fails completely.
-    """
-    # Strip markdown fences
-    text = raw.strip()
-    if "```" in text:
-        parts = text.split("```")
-        for part in parts:
-            part = part.strip()
-            if part.startswith("json"):
-                part = part[4:].strip()
-            if part.startswith("{"):
-                text = part
-                break
-
-    # Find first JSON object in the string
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
-        return None
-
-    try:
-        return json.loads(text[start:end])
-    except json.JSONDecodeError:
-        return None
-
-
-def get_investigation_target(scenario_summary: dict, already_investigated: list[str]) -> str:
-    """Ask LLM which aspect to investigate next."""
-    available = [t for t in ["ports", "packets", "flags"] if t not in already_investigated]
-    if not available:
-        return None
-
-    prompt = f"""You are a network security analyst reviewing suspicious traffic.
-
-Traffic summary:
-{json.dumps(scenario_summary, indent=2)}
-
-Already investigated: {already_investigated if already_investigated else "nothing yet"}
-
-Available investigations (pick one):
-- ports: which ports are being targeted
-- packets: average size of network packets
-- flags: system-detected anomaly indicators
-
-Which would give you the most useful information right now?
-Reply with ONLY one word from this list: {", ".join(available)}"""
-
-    answer = call_llm(prompt).strip().lower().split()[0]
-    if answer not in available:
-        answer = available[0]
-    return answer
-
-
-def decide_continue(scenario_summary: dict, clues: dict, already_investigated: list[str]) -> bool:
-    """
-    Ask LLM whether to investigate more or submit.
-    Returns True if it wants to investigate more.
-    """
-    remaining = [t for t in ["ports", "packets", "flags"] if t not in already_investigated]
-    if not remaining:
-        return False
-
-    clues_text = "\n".join(
-        f"  {target}: {json.dumps(result)}" for target, result in clues.items()
-    )
-
-    prompt = f"""You are a network security analyst.
-
-Traffic summary:
-{json.dumps(scenario_summary, indent=2)}
-
-Evidence gathered so far:
-{clues_text}
-
-Remaining options to investigate: {remaining}
-
-Are you confident enough to classify the threat, or do you need more evidence?
-- If confident: reply exactly with: submit
-- If more evidence needed: reply exactly with: investigate
-
-Reply with ONLY one word."""
-
-    answer = call_llm(prompt).strip().lower().split()[0]
-    return answer == "investigate"
-
-
-def classify_threat(scenario_summary: dict, clues: dict) -> tuple[str, str]:
-    """
-    Ask LLM to classify the threat and pick a response based on all evidence.
-    Returns (threat_type, response_action).
-    """
-    evidence_text = "\n".join(
-        f"  {target}: {json.dumps(result)}" for target, result in clues.items()
-    )
-
-    prompt = f"""You are a network security analyst. Classify this network event based on all evidence.
-
-=== TRAFFIC SUMMARY ===
-{json.dumps(scenario_summary, indent=2)}
-
-=== INVESTIGATION RESULTS ===
-{evidence_text}
-
-=== CLASSIFICATION GUIDE ===
-Use these signals to decide:
-
-ddos:
-  - Very high requests_per_second (typically 3000+)
-  - Very few unique_ips (1-8) — concentrated attack from few sources
-  - Web ports (80, 443, 8080)
-  - Small packets
-  - Short duration
-  → response: block_ip
-
-port_scan:
-  - Single unique_ip (=1)
-  - Many ports targeted, often sequential sweep
-  - Very small packets (under 65 bytes)
-  - Low rps
-  → response: alert_only
-
-brute_force:
-  - Single unique_ip (=1)
-  - Single auth port only (22=SSH, 3389=RDP, 21=FTP, 23=Telnet)
-  - Medium-large packets
-  - Long duration (sustained attack, often 2+ minutes)
-  → response: block_ip
-
-normal:
-  - Many unique_ips (typically 50 or more)
-  - Large packets (300+ bytes, real user sessions)
-  - Very long duration (hours)
-  - Reasonable rps (under 500)
-  → response: ignore
-
-=== DECISION ===
-Pick EXACTLY ONE threat_type and its correct response_action.
-Respond with ONLY this JSON and nothing else:
-{{"threat_type": "ddos", "response_action": "block_ip"}}"""
-
-    # Try up to 3 times to get a valid answer
-    for attempt in range(3):
-        raw = call_llm(prompt)
-        parsed = parse_json_answer(raw)
-        if parsed:
-            threat = parsed.get("threat_type", "").lower().strip()
-            action = parsed.get("response_action", "").lower().strip()
-            if threat in VALID_THREATS and action in VALID_RESPONSES:
-                return threat, action
-        print(f"  (Parse attempt {attempt + 1} failed, retrying...)")
-
-    # Final fallback: pick most likely from summary alone
-    print("  ⚠️  All parse attempts failed. Using conservative default.")
-    return "normal", "ignore"
-
-
-def run_episode() -> float:
-    """Run one full episode. Returns the reward."""
+def run_episode():
     with httpx.Client(base_url=ENV_URL, timeout=30) as client:
 
-        # --- Reset ---
+        # Step 1: Reset
         client.post("/reset")
 
-        # --- Get surface summary ---
+        # Step 2: Get surface summary
         r = client.post("/step", json={"action": {"tool_name": "get_scenario", "arguments": {}}})
-        data = r.json()["observation"]["result"]["data"]
-        print(f"\nScenario: {data.get('scenario_id')}")
-        print(f"Summary: rps={data.get('requests_per_second')}, "
-              f"unique_ips={data.get('unique_ips')}, "
-              f"duration={data.get('duration_seconds')}s")
+        scenario_summary = r.json()["observation"]["result"]["data"]
+        print(f"\nScenario: {scenario_summary.get('scenario_id')}")
+        print(f"Summary: rps={scenario_summary.get('requests_per_second')}, unique_ips={scenario_summary.get('unique_ips')}, duration={scenario_summary.get('duration_seconds')}s")
 
-        investigated = []   # targets already investigated this episode
-        clues = {}          # target -> result dict
+        # Step 3: Agent picks first investigation
+        investigation_prompt = f"""You are a network security analyst.
+            Network traffic summary:
+            {json.dumps(scenario_summary, indent=2)}
 
-        # --- Investigation loop (max 2 rounds) ---
-        for round_num in range(2):
-            target = get_investigation_target(data, investigated)
-            if target is None:
-                break
+            Available investigations:
+            - ports: which ports are being targeted (reveals scan vs auth vs web)
+            - packets: average packet size (small=attack, large=normal session)
+            - flags: system-detected anomaly indicators
 
-            print(f"\nAgent investigates: {target}")
-            r = client.post("/step", json={
-                "action": {"tool_name": "investigate", "arguments": {"target": target}}
-            })
-            result = r.json()["observation"]["result"]["data"]
+            Which single word would you investigate first? Reply with ONLY one word: ports, packets, or flags."""
 
-            # Environment enforces limits — check for errors
-            if "error" in result:
-                print(f"  Environment blocked: {result['error']}")
-                break
+        first_target = call_llm(investigation_prompt).strip().lower()
+        if first_target not in ["ports", "packets", "flags"]:
+            first_target = "flags"
 
-            investigated.append(target)
-            clues[target] = result
-            print(f"Clue {round_num + 1}: {json.dumps(result, indent=2)}")
+        print(f"\nAgent investigates: {first_target}")
+        r = client.post("/step", json={"action": {"tool_name": "investigate", "arguments": {"target": first_target}}})
+        clue_1 = r.json()["observation"]["result"]["data"]
+        print(f"Clue 1: {json.dumps(clue_1, indent=2)}")
 
-            # After first clue, ask if we need more
-            if round_num == 0:
-                want_more = decide_continue(data, clues, investigated)
-                if not want_more:
-                    print("\nAgent confident after 1 clue, submitting directly.")
-                    break
+        # Step 4: Decide to investigate more or submit
+        decision_prompt = f"""You are a network security analyst.
 
-        # --- Final classification ---
-        threat, action = classify_threat(data, clues)
-        print(f"\nAgent final answer: {{\"threat_type\": \"{threat}\", \"response_action\": \"{action}\"}}")
+            Summary: {json.dumps(scenario_summary, indent=2)}
+            First investigation ({first_target}): {json.dumps(clue_1, indent=2)}
 
-        # --- Submit ---
-        r = client.post("/step", json={
-            "action": {
-                "tool_name": "submit_analysis",
-                "arguments": {"threat_type": threat, "response_action": action},
-            }
-        })
+            Based on this, are you confident enough to classify, or do you need one more clue?
+
+            IMPORTANT: Do NOT investigate the same thing twice. You already investigated '{first_target}'.
+            - To investigate more: reply with exactly one of these: investigate ports / investigate packets / investigate flags
+            - To classify now: reply with exactly: submit
+
+            Reply with ONLY that one line."""
+
+        decision = call_llm(decision_prompt).strip().lower()
+
+        if decision.startswith("investigate"):
+            second_target = decision.split()[-1]
+            if second_target not in ["ports", "packets", "flags"]:
+                second_target = "packets"
+            print(f"\nAgent investigates more: {second_target}")
+            r = client.post("/step", json={"action": {"tool_name": "investigate", "arguments": {"target": second_target}}})
+            clue_2 = r.json()["observation"]["result"]["data"]
+            print(f"Clue 2: {json.dumps(clue_2, indent=2)}")
+            all_evidence = f"Summary: {json.dumps(scenario_summary)}\nClue 1 ({first_target}): {json.dumps(clue_1)}\nClue 2 ({second_target}): {json.dumps(clue_2)}"
+        else:
+            print("\nAgent confident after 1 clue, submitting directly.")
+            all_evidence = f"Summary: {json.dumps(scenario_summary)}\nClue 1 ({first_target}): {json.dumps(clue_1)}"
+
+        # Step 5: Final classification
+
+        final_prompt = f"""You are a network security analyst. Classify the network threat based on ALL evidence.
+
+            {all_evidence}
+
+            THREAT TYPES and their CORRECT RESPONSES:
+            - ddos (high rps, few IPs, web ports) → correct response: block_ip
+            - port_scan (sequential ports, single IP, low rps) → correct response: alert_only
+            - brute_force (single auth port like 22/3389/21, repeated attempts) → correct response: block_ip
+            - normal (many unique_ips like 50+, very long duration, large packets >200 bytes, reasonable rps <500) → correct response: ignore
+
+            Pick EXACTLY ONE threat_type and its matching correct response from above.
+
+            Respond with ONLY this JSON, no explanation:
+            {{"threat_type": "ddos", "response_action": "block_ip"}}"""
+
+        raw_answer = call_llm(final_prompt).strip()
+        if "```" in raw_answer:
+            raw_answer = raw_answer.split("```")[1]
+            if raw_answer.startswith("json"):
+                raw_answer = raw_answer[4:]
+        print(f"\nAgent final answer: {raw_answer}")
+
+        try:
+            parsed = json.loads(raw_answer.strip())
+            threat = parsed["threat_type"]
+            action = parsed["response_action"]
+        except (json.JSONDecodeError, KeyError):
+            threat, action = "normal", "ignore"
+
+        # Step 6: Submit
+        r = client.post("/step", json={"action": {"tool_name": "submit_analysis", "arguments": {
+            "threat_type": threat,
+            "response_action": action
+        }}})
         result = r.json()["observation"]["result"]["data"]
-
-        if "error" in result:
-            print(f"Submit error: {result['error']}")
-            return 0.0
-
         print(f"\nReward: {result['reward']}")
         print(f"Correct threat: {result['threat_correct']}, Correct response: {result['response_correct']}")
         print(f"Investigations used: {result['investigations_used']}")
@@ -274,10 +138,10 @@ def main():
     print("=" * 60)
 
     rewards = []
-    num_episodes = 10  # More episodes = better average estimate
+    num_episodes = 5
 
     for i in range(num_episodes):
-        print(f"\n--- Episode {i + 1}/{num_episodes} ---")
+        print(f"\n--- Episode {i+1}/{num_episodes} ---")
         try:
             reward = run_episode()
             rewards.append(reward)
@@ -286,13 +150,10 @@ def main():
             rewards.append(0.0)
 
     avg_reward = sum(rewards) / len(rewards)
-    correct = sum(1 for r in rewards if r >= 1.0)
-
     print("\n" + "=" * 60)
     print(f"Results over {num_episodes} episodes:")
-    print(f"Rewards: {[round(r, 2) for r in rewards]}")
+    print(f"Rewards: {rewards}")
     print(f"Average reward: {avg_reward:.3f}")
-    print(f"Perfect episodes (reward=1.0): {correct}/{num_episodes}")
     print("=" * 60)
 
 
