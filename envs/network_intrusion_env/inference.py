@@ -133,29 +133,24 @@ def run_episode():
 
 
 def main():
-    print("=" * 60)
-    print("Network Intrusion Detection - Multi-Step Inference")
-    print("=" * 60)
+    print("[START] task=network_intrusion_detection", flush=True)
 
     rewards = []
     num_episodes = 5
 
     for i in range(num_episodes):
-        print(f"\n--- Episode {i+1}/{num_episodes} ---")
+        print(f"\n--- Episode {i+1}/{num_episodes} ---", flush=True)
         try:
             reward = run_episode()
             rewards.append(reward)
+            print(f"[STEP] step={i+1} reward={reward}", flush=True)
         except Exception as e:
-            print(f"Episode failed: {e}")
+            print(f"Episode failed: {e}", flush=True)
+            print(f"[STEP] step={i+1} reward=0.0", flush=True)
             rewards.append(0.0)
 
     avg_reward = sum(rewards) / len(rewards)
-    print("\n" + "=" * 60)
-    print(f"Results over {num_episodes} episodes:")
-    print(f"Rewards: {rewards}")
-    print(f"Average reward: {avg_reward:.3f}")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+    print(f"\nResults over {num_episodes} episodes:", flush=True)
+    print(f"Rewards: {rewards}", flush=True)
+    print(f"Average reward: {avg_reward:.3f}", flush=True)
+    print(f"[END] task=network_intrusion_detection score={avg_reward:.3f} steps={num_episodes}", flush=True)
