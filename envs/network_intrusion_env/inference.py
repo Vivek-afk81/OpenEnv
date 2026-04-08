@@ -10,7 +10,7 @@ from openai import OpenAI
 
 API_BASE_URL = os.environ["API_BASE_URL"]
 API_KEY = os.environ["API_KEY"]
-MODEL_NAME = os.environ["MODEL_NAME"]
+MODEL_NAME = os.environ["MODEL_NAME","gpt-3.5-turbo"]
 
 openai_client = OpenAI(
     base_url=API_BASE_URL,
